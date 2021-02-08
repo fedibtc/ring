@@ -187,10 +187,9 @@ fn aead(
 
     // Finalize the tag and return it.
     gcm_ctx.pre_finish(|pre_tag| {
-        let bytes = tag_iv.into_bytes_less_safe();
-        let mut tag = aes_key.encrypt_block(Block::from(&bytes));
-        tag.bitxor_assign(pre_tag.into());
-        Tag(*tag.as_ref())
+        let mut output = aes_key.encrypt_block(Block::from(tag_iv.as_bytes_less_safe()));
+        output.bitxor_assign(pre_tag.into());
+        Tag(*output.as_ref())
     })
 }
 

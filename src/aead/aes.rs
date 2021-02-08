@@ -12,8 +12,19 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use super::{counter, iv::Iv, quic::Sample, Block, Direction, BLOCK_LEN};
-use crate::{bits::BitLength, c, cpu, endian::*, error, polyfill};
+use super::{
+    block::{Block, BLOCK_LEN},
+    nonce::Nonce,
+    quic::Sample,
+    Direction,
+};
+use crate::{
+    bits::BitLength,
+    c, cpu,
+    endian::{ArrayEncoding, BigEndian},
+    error,
+    polyfill::{self, ChunksFixed},
+};
 
 pub(crate) struct Key {
     inner: AES_KEY,
@@ -190,7 +201,7 @@ impl Key {
 
     #[inline]
     pub fn encrypt_iv_xor_block(&self, iv: Iv, input: Block) -> Block {
-        let mut output = self.encrypt_block(Block::from(&iv.into_bytes_less_safe()));
+        let mut output = self.encrypt_block(Block::from(iv.as_bytes_less_safe()));
         output.bitxor_assign(input);
         output
     }
@@ -335,7 +346,44 @@ pub enum Variant {
     AES_256,
 }
 
-pub type Counter = counter::Counter<BigEndian<u32>>;
+/// Nonce || Counter, all big-endian.
+#[repr(transparent)]
+pub(super) struct Counter([BigEndian<u32>; 4]);
+
+impl Counter {
+    pub fn one(nonce: Nonce) -> Self {
+        let nonce = nonce.as_ref().chunks_fixed();
+        Self([nonce[0].into(), nonce[1].into(), nonce[2].into(), 1.into()])
+    }
+
+    pub fn increment(&mut self) -> Iv {
+        let iv = Iv(self.0);
+        self.increment_by_less_safe(1);
+        iv
+    }
+
+    fn increment_by_less_safe(&mut self, increment_by: u32) {
+        let old_value: u32 = self.0[3].into();
+        self.0[3] = (old_value + increment_by).into();
+    }
+}
+
+/// The IV for a single block encryption.
+///
+/// Intentionally not `Clone` to ensure each is used only once.
+pub struct Iv([BigEndian<u32>; 4]);
+
+impl From<Counter> for Iv {
+    fn from(counter: Counter) -> Self {
+        Self(counter.0)
+    }
+}
+
+impl Iv {
+    pub(super) fn as_bytes_less_safe(&self) -> &[u8; 16] {
+        self.0.as_byte_array()
+    }
+}
 
 #[repr(C)] // Only so `Key` can be `#[repr(C)]`
 #[derive(Clone, Copy)]
