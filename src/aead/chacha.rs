@@ -13,9 +13,20 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use super::quic::Sample;
 use super::BLOCK_LEN;
-use crate::{aead::Nonce, c, polyfill::ChunksFixed };
+use super::{quic::Sample, Nonce};
+use crate::polyfill::ChunksFixed;
+
+#[cfg(any(
+    test,
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "x86_64",
+    ))
+))]
+mod fallback;
 
 #[repr(transparent)]
 pub struct Key([u32; KEY_LEN / 4]);
@@ -110,30 +121,56 @@ impl Key {
         in_out_len: usize,
         output: *mut u8,
     ) {
-        let iv = match counter {
-            CounterOrIv::Counter(counter) => counter.into(),
-            CounterOrIv::Iv(iv) => {
-                assert!(in_out_len <= 32);
-                iv
+        #[cfg(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64",
+        ))]
+        #[inline(always)]
+        fn chacha20_ctr32(
+            key: &Key,
+            counter: CounterOrIv,
+            input: *const u8,
+            in_out_len: usize,
+            output: *mut u8,
+        ) {
+            let iv = match counter {
+                CounterOrIv::Counter(counter) => counter.into(),
+                CounterOrIv::Iv(iv) => {
+                    assert!(in_out_len <= 32);
+                    iv
+                }
+            };
+            // There's no need to worry if `counter` is incremented because it is
+            // owned here and we drop immediately after the call.
+            extern "C" {
+                fn GFp_ChaCha20_ctr32(
+                    out: *mut u8,
+                    in_: *const u8,
+                    in_len: crate::c::size_t,
+                    key: &Key,
+                    first_iv: &Iv,
+                );
             }
-        };
-
-        /// XXX: Although this takes an `Iv`, this actually uses it like a
-        /// `Counter`.
-        extern "C" {
-            fn GFp_ChaCha20_ctr32(
-                out: *mut u8,
-                in_: *const u8,
-                in_len: c::size_t,
-                key: &Key,
-                first_iv: &Iv,
-            );
+            unsafe { GFp_ChaCha20_ctr32(output, input, in_out_len, key, &iv) }
         }
 
-        GFp_ChaCha20_ctr32(output, input, in_out_len, self, &iv);
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64",
+        )))]
+        use fallback::chacha20_ctr32;
+
+        chacha20_ctr32(self, counter, input, in_out_len, output);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(
+        test,
+        not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86"))
+    ))]
     #[inline]
     pub(super) fn words_less_safe(&self) -> &[u32; KEY_LEN / 4] {
         &self.0
@@ -163,6 +200,21 @@ impl Counter {
         self.0[0] += 1;
         iv
     }
+
+    /// This is "less safe" because it hands off management of the counter to
+    /// the caller.
+    #[cfg(any(
+        test,
+        not(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64",
+        ))
+    ))]
+    fn into_words_less_safe(self) -> [u32; 4] {
+        self.0
+    }
 }
 
 /// The IV for a single block encryption.
@@ -181,6 +233,21 @@ impl Iv {
             u32::from_le_bytes(value[3]),
         ])
     }
+
+    /// This is "less safe" because it hands off management of the counter to
+    /// the caller.
+    #[cfg(any(
+        test,
+        not(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64",
+        ))
+    ))]
+    fn into_words_less_safe(self) -> [u32; 4] {
+        self.0
+    }
 }
 
 impl From<Counter> for Iv {
@@ -197,26 +264,58 @@ enum CounterOrIv {
 const KEY_BLOCKS: usize = 2;
 pub const KEY_LEN: usize = KEY_BLOCKS * BLOCK_LEN;
 
-#[cfg(test)]
+#[cfg(test_later)]
 mod tests {
     use super::*;
-    use crate::test;
+    use crate::{test, polyfill};
     use alloc::vec;
     use core::convert::TryInto;
 
-    // This verifies the encryption functionality provided by ChaCha20_ctr32
-    // is successful when either computed on disjoint input/output buffers,
-    // or on overlapping input/output buffers. On some branches of the 32-bit
-    // x86 and ARM code the in-place operation fails in some situations where
-    // the input/output buffers are not exactly overlapping. Such failures are
-    // dependent not only on the degree of overlapping but also the length of
-    // the data. `open()` works around that by moving the input data to the
-    // output location so that the buffers exactly overlap, for those targets.
-    // This test exists largely as a canary for detecting if/when that type of
-    // problem spreads to other platforms.
+    const MAX_ALIGNMENT_AND_OFFSET: (usize, usize) = (15, 259);
+    const MAX_ALIGNMENT_AND_OFFSET_SUBSET: (usize, usize) =
+        if cfg!(any(debug_assertions = "false", feature = "slow_tests")) {
+            MAX_ALIGNMENT_AND_OFFSET
+        } else {
+            (0, 0)
+        };
+
     #[test]
-    pub fn chacha20_tests() {
-        test::run(test_file!("chacha_tests.txt"), |section, test_case| {
+    fn chacha20_test_default() {
+        // Always use `MAX_OFFSET` if we hav assembly code.
+        let max_offset = if cfg!(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )) {
+            MAX_ALIGNMENT_AND_OFFSET
+        } else {
+            MAX_ALIGNMENT_AND_OFFSET_SUBSET
+        };
+        chacha20_test(max_offset, Key::encrypt_within);
+    }
+
+    // Smoketest the fallback implementation.
+    #[test]
+    fn chacha20_test_fallback() {
+        chacha20_test(MAX_ALIGNMENT_AND_OFFSET_SUBSET, fallback::chacha20_ctr32);
+    }
+
+    // Verifies the encryption is successful when done on overlapping buffers.
+    //
+    // On some branches of the 32-bit x86 and ARM assembly code the in-place
+    // operation fails in some situations where the input/output buffers are
+    // not exactly overlapping. Such failures are dependent not only on the
+    // degree of overlapping but also the length of the data. `encrypt_within`
+    // works around that.
+    fn chacha20_test(
+        max_alignment_and_offset: (usize, usize),
+        f: impl for<'k, 'i> Fn(&'k Key, Counter, &'i mut [u8], RangeFrom<usize>),
+    ) {
+        // Reuse a buffer to avoid slowing down the tests with allocations.
+        let mut buf = vec![0u8; 1300];
+
+        test::run(test_file!("chacha_tests.txt"), move |section, test_case| {
             assert_eq!(section, "");
 
             let key = test_case.consume_bytes("Key");
@@ -241,8 +340,9 @@ mod tests {
                     ctr as u32,
                     &input[..len],
                     &output[..len],
-                    len,
-                    &mut in_out_buf,
+                    &mut buf,
+                    max_alignment_and_offset,
+                    &f,
                 );
             }
 
@@ -256,44 +356,30 @@ mod tests {
         ctr: u32,
         input: &[u8],
         expected: &[u8],
-        len: usize,
-        in_out_buf: &mut [u8],
+        buf: &mut [u8],
+        (max_alignment, max_offset): (usize, usize),
+        f: &impl for<'k, 'i> Fn(&'k Key, Counter, &'i mut [u8], RangeFrom<usize>),
     ) {
+        const ARBITRARY: u8 = 123;
+
         let counter =
             Counter::from_nonce_and_ctr(Nonce::try_assume_unique_for_key(nonce).unwrap(), ctr);
 
-        // Straightforward encryption into disjoint buffers is computed
-        // correctly.
-        unsafe {
-            key.encrypt(
-                CounterOrIv::Counter(counter),
-                input[..len].as_ptr(),
-                len,
-                in_out_buf.as_mut_ptr(),
-            );
-        }
-        assert_eq!(&in_out_buf[..len], expected);
-
-        // Do not test offset buffers for x86 and ARM architectures (see above
-        // for rationale).
-        let max_offset = if cfg!(any(target_arch = "x86", target_arch = "arm")) {
-            0
-        } else {
-            259
-        };
-
-        // Check that in-place encryption works successfully when the pointers
-        // to the input/output buffers are (partially) overlapping.
-        for alignment in 0..16 {
-            for offset in 0..(max_offset + 1) {
-                in_out_buf[alignment + offset..][..len].copy_from_slice(input);
+        for alignment in 0..=max_alignment {
+            polyfill::slice::fill(&mut buf[..alignment], ARBITRARY);
+            let buf = &mut buf[alignment..];
+            for offset in 0..=max_offset {
+                let buf = &mut buf[..(offset + input.len())];
+                polyfill::slice::fill(&mut buf[..offset], ARBITRARY);
+                let src = offset..;
+                buf[src.clone()].copy_from_slice(input);
 
                 let ctr = Counter::from_nonce_and_ctr(
                     Nonce::try_assume_unique_for_key(nonce).unwrap(),
                     ctr,
                 );
-                key.encrypt_overlapping(ctr, &mut in_out_buf[alignment..], offset);
-                assert_eq!(&in_out_buf[alignment..][..len], expected);
+                f(key, ctr, buf, src);
+                assert_eq!(&buf[..input.len()], expected)
             }
         }
     }
