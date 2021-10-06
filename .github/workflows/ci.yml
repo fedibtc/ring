@@ -311,8 +311,8 @@ jobs:
     strategy:
       matrix:
         features:
-          - # Default
-          - --features=wasm32_c
+          - --features=wasm32_unknown_unknown_js
+          - --no-default-features --features=wasm32_unknown_unknown_js
         host_os:
           - ubuntu-18.04
         mode:
