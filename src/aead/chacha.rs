@@ -264,10 +264,10 @@ enum CounterOrIv {
 const KEY_BLOCKS: usize = 2;
 pub const KEY_LEN: usize = KEY_BLOCKS * BLOCK_LEN;
 
-#[cfg(test_later)]
+#[cfg(test_not_for_now)]
 mod tests {
     use super::*;
-    use crate::{test, polyfill};
+    use crate::{polyfill, test};
     use alloc::vec;
     use core::convert::TryInto;
 
